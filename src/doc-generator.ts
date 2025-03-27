@@ -1,35 +1,49 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
+import { DocumentUtils } from './utils/document-utils';
 import { FrameworkDetector } from './architecture/detectors/framework-detector';
 import { BaseFrameworkAnalyzer } from './architecture/analyzers/base-analyzer';
-import { ArchitectureInfo } from './architecture/models/architecture-info';
+import { ArchitectureInfo, ProjectInfo } from './architecture/models/architecture-info';
 
 export class DocGenerator {
     private workspaceRoot: string;
     private analyzer: BaseFrameworkAnalyzer;
 
-    constructor() {
+    private constructor(workspaceRoot: string, analyzer: BaseFrameworkAnalyzer) {
+        this.workspaceRoot = workspaceRoot;
+        this.analyzer = analyzer;
+    }
+
+    public static async create(): Promise<DocGenerator> {
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (!workspaceFolders) {
             throw new Error('Nenhum projeto aberto no workspace');
         }
-        this.workspaceRoot = workspaceFolders[0].uri.fsPath;
-        this.analyzer = FrameworkDetector.detect(this.workspaceRoot);
+        
+        const workspaceRoot = workspaceFolders[0].uri.fsPath;
+        const analyzer = await FrameworkDetector.detect(workspaceRoot);
+        
+        return new DocGenerator(workspaceRoot, analyzer);
     }
 
     public async generate(): Promise<void> {
         const readmePath = path.join(this.workspaceRoot, 'README.md');
         
-        if (await this.shouldOverwrite(readmePath) === false) {
+        if (!(await this.shouldOverwrite(readmePath))) {
             return;
         }
 
-        const projectInfo = await this.analyzeProject();
-        const content = this.generateFullDocumentation(projectInfo);
-        
-        fs.writeFileSync(readmePath, content);
-        vscode.window.showInformationMessage('Documentação gerada com sucesso!');
+        try {
+            const projectInfo = await this.analyzeProject();
+            const content = this.generateFullDocumentation(projectInfo);
+            fs.writeFileSync(readmePath, content);
+            vscode.window.showInformationMessage('✅ Documentação gerada com sucesso!');
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            vscode.window.showErrorMessage(`❌ Falha ao gerar documentação: ${errorMessage}`);
+            console.error('[DocGenerator] Erro:', error);
+        }
     }
 
     private async shouldOverwrite(readmePath: string): Promise<boolean> {
@@ -39,7 +53,10 @@ export class DocGenerator {
         
         const choice = await vscode.window.showQuickPick(
             ['Sim', 'Não'], 
-            { placeHolder: 'README.md já existe. Deseja sobrescrever?' }
+            { 
+                placeHolder: 'README.md já existe. Deseja sobrescrever?',
+                ignoreFocusOut: true
+            }
         );
         
         return choice === 'Sim';
@@ -47,41 +64,34 @@ export class DocGenerator {
 
     private async analyzeProject(): Promise<ProjectInfo> {
         const archInfo = await this.analyzer.analyze();
-        const packageJson = this.getPackageJson();
-        const dependencies = packageJson?.dependencies || {};
-        const devDependencies = packageJson?.devDependencies || {};
+        const packageJson = DocumentUtils.getPackageJson(this.workspaceRoot);
 
         return {
             projectName: path.basename(this.workspaceRoot),
             architecture: archInfo,
-            dependencies: { ...dependencies, ...devDependencies },
+            dependencies: { 
+                ...packageJson?.dependencies, 
+                ...packageJson?.devDependencies 
+            },
             scripts: packageJson?.scripts || {},
-            mainFile: this.findMainFile(),
-            hasTests: fs.existsSync(path.join(this.workspaceRoot, 'test')) || 
-                     fs.existsSync(path.join(this.workspaceRoot, '__tests__'))
+            mainFile: DocumentUtils.findMainFile(this.workspaceRoot),
+            hasTests: DocumentUtils.hasTests(this.workspaceRoot),
+            repositoryUrl: await this.detectRepositoryUrl()
         };
     }
 
-    private getPackageJson(): any {
-        const packageJsonPath = path.join(this.workspaceRoot, 'package.json');
-        if (fs.existsSync(packageJsonPath)) {
-            return JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
-        }
-        return null;
-    }
-
-    private findMainFile(): string | null {
-        const possibleFiles = [
-            'src/main.ts', 'src/index.ts', 'src/App.tsx', 
-            'src/main.js', 'src/index.js', 'src/App.js',
-            'main.ts', 'index.ts', 'App.tsx',
-            'main.js', 'index.js', 'App.js'
-        ];
-
-        for (const file of possibleFiles) {
-            if (fs.existsSync(path.join(this.workspaceRoot, file))) {
-                return file;
+    private async detectRepositoryUrl(): Promise<string | null> {
+        try {
+            const gitConfigPath = path.join(this.workspaceRoot, '.git', 'config');
+            if (fs.existsSync(gitConfigPath)) {
+                const gitConfig = fs.readFileSync(gitConfigPath, 'utf8');
+                const urlMatch = gitConfig.match(/url\s*=\s*(.+)/);
+                if (urlMatch && urlMatch[1]) {
+                    return urlMatch[1].replace('git@github.com:', 'https://github.com/').replace('.git', '');
+                }
             }
+        } catch (error) {
+            console.warn('Não foi possível detectar URL do repositório:', error);
         }
         return null;
     }
@@ -99,12 +109,7 @@ ${this.generateInstallationSection(info)}
 
 ${this.generateCodeDocumentationSection(info)}
 
-## Informações do Projeto
-
-**URL do Repositório**: [Inserir URL do repositório]
-
-**Como contribuir**: [Instruções para contribuição]
-`;
+${this.generateProjectInfoSection(info)}`;
     }
 
     private generateArchitectureSection(info: ProjectInfo): string {
@@ -113,8 +118,7 @@ ${this.generateCodeDocumentationSection(info)}
         return `## 1. Arquitetura do Sistema e Diagramas de Fluxo
 
 ### Arquitetura Geral
-${architecture.framework === 'React' ? this.generateReactArchitecture() : ''}
-${architecture.framework === 'Angular' ? this.generateAngularArchitecture() : ''}
+${this.generateFrameworkSpecificArchitecture(architecture)}
 
 ### Fluxo de Dados Principais
 1. **Fluxo de Renderização**:
@@ -127,32 +131,117 @@ ${architecture.framework === 'Angular' ? this.generateAngularArchitecture() : ''
    - Gerenciamento de estado
    - Integração com APIs (se aplicável)
 
-${this.generateFolderStructureMarkdown(architecture.folderStructure)}`;
+${DocumentUtils.generateFolderStructure(architecture.folderStructure)}`;
     }
 
-    private generateReactArchitecture(): string {
-        return `O projeto segue uma arquitetura baseada em componentes React com:
+    private generateFrameworkSpecificArchitecture(archInfo: ArchitectureInfo): string {
+        const frameworkTemplates = {
+            'React': `O projeto segue uma arquitetura baseada em componentes React com:
 - Separação clara entre componentes de UI e lógica de negócios
-- Gerenciamento de estado centralizado
-- Roteamento de páginas (se aplicável)`;
-    }
+- Gerenciamento de estado ${archInfo.characteristics.includes('Redux') ? 'com Redux' : 'com React Hooks'}
+- Roteamento ${archInfo.characteristics.includes('React Router') ? 'com React Router' : 'básico'}`,
 
-    private generateAngularArchitecture(): string {
-        return `O projeto utiliza a arquitetura modular do Angular com:
+            'Angular': `O projeto utiliza a arquitetura modular do Angular com:
 - Módulos por funcionalidade
 - Componentes inteligentes e apresentacionais
 - Serviços para lógica de negócios
-- Injeção de dependências`;
+- Injeção de dependências`,
+
+            'default': `O projeto segue uma arquitetura ${archInfo.framework === 'Node.js' ? 'Node.js' : 'JavaScript/TypeScript'} com:
+- Estrutura de pastas organizada por funcionalidade
+- Separação entre lógica de negócios e apresentação`
+        };
+
+        return frameworkTemplates[archInfo.framework as keyof typeof frameworkTemplates] || frameworkTemplates.default;
     }
 
-    // ... (implementar os outros métodos de geração de seções)
-}
+    private generateTechnologiesSection(info: ProjectInfo): string {
+        const coreDeps = DocumentUtils.filterCoreDependencies(info.dependencies);
+        
+        return `## 2. Descrição das Tecnologias e Ferramentas Utilizadas
 
-interface ProjectInfo {
-    projectName: string;
-    architecture: ArchitectureInfo;
-    dependencies: { [key: string]: string };
-    scripts: { [key: string]: string };
-    mainFile: string | null;
-    hasTests: boolean;
+### Tecnologias Principais
+${coreDeps.map(dep => `- **${dep.name}@${dep.version}**: ${
+    DocumentUtils.getPackageDescription(dep.name)
+}`).join('\n')}
+
+### Ferramentas de Desenvolvimento
+- **VS Code**: Editor principal
+- **ESLint**: Linting de código
+- **TypeScript**: Checagem de tipos${info.architecture.framework === 'Angular' ? '\n- **Angular CLI**: Ferramenta de construção' : ''}`;
+    }
+
+    private generateApiSection(info: ProjectInfo): string {
+        return `## 3. Documentação da API
+
+${DocumentUtils.detectApiEndpoints(this.workspaceRoot) || 'A aplicação não utiliza APIs externas ou a integração ainda não foi implementada.'}`;
+    }
+
+    private generateInstallationSection(info: ProjectInfo): string {
+        const installCommands = info.architecture.framework === 'Angular' ? 
+            'npm install -g @angular/cli\nnpm install' : 
+            'npm install';
+
+        const startCommand = info.scripts.dev ? 
+            `npm run ${info.scripts.dev}` : 
+            info.scripts.start ? 
+            `npm run ${info.scripts.start}` : 
+            'npm start';
+
+        return `## 4. Manual de Instalação e Configuração
+
+### Requisitos do Sistema
+- Node.js (versão 16 ou superior)
+- npm ou yarn
+${info.architecture.framework === 'Angular' ? '- Angular CLI (global)' : ''}
+
+### Instalação
+1. Clone o repositório:
+   \`\`\`bash
+   git clone ${info.repositoryUrl || '<URL_DO_REPOSITORIO>'}
+   cd ${info.projectName}
+   \`\`\`
+
+2. Instale as dependências:
+   \`\`\`bash
+   ${installCommands}
+   \`\`\`
+
+3. Inicie o servidor de desenvolvimento:
+   \`\`\`bash
+   ${startCommand}
+   \`\`\``;
+    }
+
+    private generateCodeDocumentationSection(info: ProjectInfo): string {
+        const components = DocumentUtils.detectMainComponents(this.workspaceRoot);
+        
+        return `## 5. Documentação do Código
+
+### Estrutura de Diretórios
+${DocumentUtils.generateFolderStructure(info.architecture.folderStructure)}
+
+### Principais Componentes
+${components.length > 0 ? 
+    components.map(c => `- **${c.name}**: ${c.description || 'Componente principal'}`).join('\n') : 
+    'Não foram detectados componentes principais'}
+
+### Padrões e Convenções
+- Nomenclatura de arquivos e componentes
+- Organização de imports
+- Estrutura de pastas`;
+    }
+
+    private generateProjectInfoSection(info: ProjectInfo): string {
+        return `## Informações do Projeto
+
+**URL do Repositório**: ${info.repositoryUrl || '[Inserir URL do repositório]'}
+
+**Como contribuir**:
+1. Faça um fork do projeto
+2. Crie uma branch para sua feature (\`git checkout -b feature/nova-feature\`)
+3. Commit suas mudanças (\`git commit -m 'Adiciona nova feature'\`)
+4. Push para a branch (\`git push origin feature/nova-feature\`)
+5. Abra um Pull Request`;
+    }
 }
