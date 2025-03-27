@@ -26,12 +26,11 @@ export interface ComponentInfo {
 }
 
 export interface ProjectInfo {
+    projectName: string;
+    architecture: ArchitectureInfo;
     dependencies: { [key: string]: string };
-    projectStructure: string[];
-    architectureInfo: {
-        framework: string;
-        architectureType: string;
-        folderStructure: FolderStructure;
-        characteristics: string[];
-    };
+    scripts: { [key: string]: string };
+    mainFile: string | null;
+    hasTests: boolean;
+    repositoryUrl: string | null;
 }
